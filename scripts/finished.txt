@@ -1,0 +1,21 @@
+Week 8 Lab: EC2 + ALB Benchmark on AWS — FINISHED
+
+Completed checklist:
+[x] Preflight: credentials, region, tools verified
+[x] terraform init / fmt / validate / plan / apply
+[x] Target health verified (both EC2 targets: healthy)
+[x] Warm-up requests completed (5 curl requests)
+[x] Raw ab check executed and interpreted
+[x] Scenario 1 — Baseline ALB (C=10, N=100, TARGET_MODE=alb)
+[x] Scenario 2 — Higher Concurrency ALB (C=40, N=400, TARGET_MODE=alb)
+[x] Scenario 3 — Direct EC2 Comparison (C=10, N=100, TARGET_MODE=direct)
+[x] benchmark/summary.csv reviewed and analyzed
+[x] commands.md written with all 8 interpretation answers
+[x] report.md written with full analysis
+[x] terraform destroy -auto-approve completed
+[x] AWS Console confirmed: EC2 instances terminated, ALB removed
+
+Submitted files:
+- commands.md
+- report.md
+- finished.txt
