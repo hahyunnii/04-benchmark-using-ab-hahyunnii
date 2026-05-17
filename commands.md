@@ -1,253 +1,171 @@
-# commands.md — Week 8 Lab: EC2 + ALB Benchmark on AWS
+# commands.md — Week 8 Lab: Benchmark Using ab
 
-## Environment & Setup
+## 환경 준비
 
-### Preflight
-
+### ab 설치
 ```bash
-cd eng/toy-examples/terraform-04-ec2-alb-benchmark
-aws sts get-caller-identity
-aws configure get region
-terraform version
-command -v ab || echo "ab not found; curl fallback will be used"
-cp terraform.tfvars.example terraform.tfvars
-grep subnet_count terraform.tfvars
+sudo dnf install -y httpd-tools
+ab -V
 ```
 
-### Terraform Deployment
-
+### 레포 클론 및 권한 부여
 ```bash
-terraform init
-terraform fmt
-terraform validate
-terraform plan -out plan.out
-terraform apply plan.out
-terraform output
-ALB_DNS="$(terraform output -raw alb_dns_name)"
+git clone https://github.com/hahyunnii/04-benchmark-using-ab-hahyunnii.git
+cd 04-benchmark-using-ab-hahyunnii
+chmod +x scripts/*.sh
 ```
 
 ---
 
-## Step 1 — Verify Target Health
+## 인프라 배포 (lab03 - Terraform)
 
 ```bash
+cd ~/03-terraform-ec2-alb-hahyunnii/terraform-03-alb-two-ec2
+terraform init
+terraform apply -auto-approve
+```
+
+- ALB DNS: `ccaws-tf03-alb-959492896.us-east-1.elb.amazonaws.com`
+- web-a IP: `32.197.44.252`
+- web-b IP: `44.201.202.82`
+
+---
+
+## 타겟 헬스 확인
+
+```bash
+ALB_DNS="$(terraform output -raw alb_dns_name)"
 aws elbv2 describe-target-health \
   --target-group-arn "$(terraform output -raw target_group_arn)"
 ```
 
-- **Expected output:** Both targets show `"State": "healthy"`
-- **Interpretation:** ALB가 두 EC2 인스턴스 모두를 정상 타겟으로 인식하고 있음을 확인. 하나라도 `unhealthy` 상태면 벤치마크 실행 전에 반드시 해결해야 함.
+- **결과:** 두 인스턴스(i-0283f7034737c23f9, i-0e793ec6f067969ae) 모두 `State: healthy` 확인
+- **Interpretation:** ALB가 두 EC2 인스턴스 모두를 정상 타겟으로 인식하고 있음을 확인. 벤치마크 실행 전 필수 확인 단계.
 
 ---
 
-## Step 2 — Warm-Up Requests
+## 워밍업
 
 ```bash
 for i in 1 2 3 4 5; do
-  curl -s "http://$(terraform output -raw alb_dns_name)" | head -n 1
+  curl -s "http://${ALB_DNS}" | head -n 1
 done
 ```
 
-- **Expected output (5 lines):**
-  ```
-  <!DOCTYPE html>
-  <!DOCTYPE html>
-  <!DOCTYPE html>
-  <!DOCTYPE html>
-  <!DOCTYPE html>
-  ```
-- **Interpretation:** ALB 라우팅 테이블을 초기화하고, 두 EC2 백엔드가 실제 요청에 응답할 준비가 됐음을 확인. 콜드 스타트 레이턴시가 벤치마크 수치에 영향을 주지 않도록 사전 워밍.
+- **결과:** `<h1>Terraform Example 03</h1>` 5회 출력
+- **Interpretation:** ALB 라우팅 테이블 초기화 및 콜드 스타트 레이턴시 제거.
 
 ---
 
 ## Raw ab Check
 
 ### Command
-
 ```bash
-ALB_DNS="$(terraform output -raw alb_dns_name)"
-ab -n 100 -c 10 "http://${ALB_DNS}/"
+ab -n 60 -c 1 "http://ccaws-tf03-alb-959492896.us-east-1.elb.amazonaws.com/"
 ```
 
 ### Key Output
-
 ```
-Concurrency Level:      10
-Time taken for tests:   2.364 seconds
-Complete requests:      100
+Server Software:        nginx/1.30.0
+Concurrency Level:      1
+Complete requests:      60
 Failed requests:        0
-Requests per second:    42.30 [#/sec] (mean)
-Time per request:       236.4 [ms] (mean)
-Time per request:       23.64 [ms] (mean, across all concurrent requests)
+Requests per second:    676.90 [#/sec] (mean)
+Time per request:       1.477 [ms] (mean)
 
 Percentage of the requests served within a certain time (ms)
-  50%     21
-  66%     24
-  75%     27
-  80%     30
-  90%     36
-  95%     41
-  98%     67
-  99%    112
- 100%    189 (longest request)
+  50%      1
+  95%      2
+  99%      3
+ 100%      3 (longest request)
 ```
 
 ### Interpretation
-
-`-n 100`은 총 전송 요청 수, `-c 10`은 동시 처리 요청 수를 의미한다. `Complete requests: 100`이 `-n`값과 일치하고 `Failed requests: 0`이므로 ALB와 두 EC2 백엔드가 정상 동작 중임을 확인했다. `Requests per second: 42.30`은 처리량 기준점(baseline)이다. `Time per request: 23.64ms`(동시 요청 기준 평균)보다 `p99: 112ms`, `p100: 189ms`가 훨씬 높다는 것은 tail latency가 존재한다는 신호로, 일부 요청이 평균보다 훨씬 느리게 처리되고 있음을 의미한다.
+`-n 60`은 총 요청 수, `-c 1`은 순차 요청(동시성 없음)을 의미한다. `Complete requests: 60`이 `-n`값과 일치하고 `Failed requests: 0`이므로 ALB와 두 EC2 백엔드가 정상 동작 중임을 확인했다. C=1에서 RPS 676.90, p95 2ms가 순수 단일 요청 처리 속도의 기준점이 된다. p95(2ms)와 p100(3ms)의 격차가 매우 작아 응답 시간이 일관적임을 확인했다.
 
 ---
 
-## Scenario 1 — Baseline ALB
+## Benchmark Scenarios
 
-### Command
+### Scenario 1: latency-baseline (C=1, N=60)
+- Command:
+  ```bash
+  cd ~/04-benchmark-using-ab-hahyunnii
+  TARGET_URL="http://ccaws-tf03-alb-959492896.us-east-1.elb.amazonaws.com/" \
+  PRIMARY_LABEL="alb" \
+  bash scripts/run-sample-scenarios.sh
+  ```
+- Key output (CSV row):
+  `latency-baseline,alb,ab,60,1,60,0,0.001000,0.002000,676.90`
+- Interpretation: 동시성 1에서 RPS 676.90, avg 1ms, p95 2ms. 순차 처리 기준점으로, 이후 동시성 증가 시나리오와 비교하는 기준이 된다.
 
-```bash
-RESET_SUMMARY=true \
-SCENARIO_NAME=baseline-alb \
-REQUESTS=100 \
-CONCURRENCY=10 \
-TARGET_MODE=alb \
-bash scripts/benchmark-ec2-alb.sh
-```
+### Scenario 2: throughput-baseline (C=10, N=100)
+- Key output (CSV row):
+  `throughput-baseline,alb,ab,100,10,100,0,0.002000,0.002000,5481.25`
+- Interpretation: 동시성 10에서 RPS 5,481로 C=1 대비 약 8.1배 증가했다. avg와 p95 latency가 모두 2ms로 동일하게 유지되어 서버가 동시 요청을 효율적으로 처리하고 있음을 나타낸다.
 
-### Key Output (summary.csv row)
+### Scenario 3: concurrency-step-c20 (C=20, N=200)
+- Key output (CSV row):
+  `concurrency-step-c20,alb,ab,200,20,200,0,0.002000,0.004000,7284.65`
+- Interpretation: 동시성 20에서 RPS 7,284로 C=10 대비 약 33% 증가했다. p95 latency가 2ms→4ms로 증가하기 시작했다. 처리량 증가 폭이 줄어들며 포화 근접 신호가 나타나기 시작했다.
 
-```
-baseline-alb,alb,ab,100,10,100,0,0.023,0.041,42.30
-```
+### Scenario 4: tail-latency-c30 (C=30, N=300)
+- Key output (CSV row):
+  `tail-latency-c30,alb,ab,300,30,300,0,0.003000,0.005000,8056.50`
+- Interpretation: 동시성 30에서 RPS 8,056. avg 3ms, p95 5ms로 latency가 소폭 증가했다. 실패 0건이지만 처리량 증가폭이 점차 줄어들고 있다.
 
-| 항목 | 값 |
-|------|-----|
-| Scenario | baseline-alb |
-| Target | alb |
-| Tool | ab |
-| Requests | 100 |
-| Concurrency | 10 |
-| Success | 100 |
-| Failed | 0 |
-| Avg time (sec) | 0.023 |
-| P95 time (sec) | 0.041 |
-| Requests/sec | 42.30 |
+### Scenario 5: saturation-c50 (C=50, N=1000)
+- Key output (CSV row):
+  `saturation-c50,alb,ab,1000,50,1000,0,0.005000,0.009000,8749.75`
+- Interpretation: 동시성 50에서 RPS 8,749. avg 5ms, p95 9ms. C=30 대비 RPS 증가폭(+693)이 크게 줄었고 p95 latency는 5ms→9ms로 80% 증가했다. 포화 임계점에 근접하고 있다.
 
-### Interpretation
-
-동시성 10, 요청 100개 기준 baseline에서 모든 요청이 성공했고(Failed=0) 처리량은 42.30 req/s, p95 레이턴시는 41ms였다. 이 수치가 이후 모든 시나리오 비교의 기준점(reference)이 된다.
-
----
-
-## Scenario 2 — Higher Concurrency ALB
-
-### Command
-
-```bash
-SCENARIO_NAME=higher-concurrency-alb \
-REQUESTS=400 \
-CONCURRENCY=40 \
-TARGET_MODE=alb \
-bash scripts/benchmark-ec2-alb.sh
-```
-
-### Key Output (summary.csv row)
-
-```
-higher-concurrency-alb,alb,ab,400,40,398,2,0.038,0.089,47.10
-```
-
-| 항목 | 값 |
-|------|-----|
-| Scenario | higher-concurrency-alb |
-| Target | alb |
-| Tool | ab |
-| Requests | 400 |
-| Concurrency | 40 |
-| Success | 398 |
-| Failed | 2 |
-| Avg time (sec) | 0.038 |
-| P95 time (sec) | 0.089 |
-| Requests/sec | 47.10 |
-
-### Interpretation
-
-동시성을 4배(10→40)로 높였을 때 처리량은 42.30→47.10 req/s로 소폭 증가에 그쳤다. 그러나 avg latency는 23ms→38ms(+65%), p95 latency는 41ms→89ms(+117%)로 급증했고, 2건의 실패가 발생했다. 처리량 증가가 미미하고 tail latency가 크게 늘어난 것은 백엔드가 포화 임계점(saturation point)에 근접했다는 신호다.
+### Scenario 6: saturation-c100 (C=100, N=2000)
+- Key output (CSV row):
+  `saturation-c100,alb,ab,2000,100,2000,0,0.011000,0.015000,8896.92`
+- Interpretation: 동시성 100에서 RPS 8,896으로 C=50 대비 고작 +147(+1.7%) 증가에 그쳤다. 그러나 avg latency는 5ms→11ms(+120%), p95는 9ms→15ms(+67%)로 급등했다. RPS 정체와 latency 급등이 동시에 나타났으며 이것이 첫 번째 명확한 포화 신호다.
 
 ---
 
-## Scenario 3 — Direct EC2 Comparison
-
-### Command
-
-```bash
-SCENARIO_NAME=direct-compare \
-REQUESTS=100 \
-CONCURRENCY=10 \
-TARGET_MODE=direct \
-bash scripts/benchmark-ec2-alb.sh
-```
-
-### Key Output (summary.csv row)
+## Final summary.csv
 
 ```
-direct-compare,direct,ab,100,10,100,0,0.020,0.038,48.20
+scenario,target,tool,requests,concurrency,success,failed,avg_time_sec,p95_time_sec,requests_per_sec
+latency-baseline,alb,ab,60,1,60,0,0.001000,0.002000,676.90
+throughput-baseline,alb,ab,100,10,100,0,0.002000,0.002000,5481.25
+concurrency-step-c20,alb,ab,200,20,200,0,0.002000,0.004000,7284.65
+tail-latency-c30,alb,ab,300,30,300,0,0.003000,0.005000,8056.50
+saturation-c50,alb,ab,1000,50,1000,0,0.005000,0.009000,8749.75
+saturation-c100,alb,ab,2000,100,2000,0,0.011000,0.015000,8896.92
 ```
-
-| 항목 | 값 |
-|------|-----|
-| Scenario | direct-compare |
-| Target | direct (EC2 Instance 1) |
-| Tool | ab |
-| Requests | 100 |
-| Concurrency | 10 |
-| Success | 100 |
-| Failed | 0 |
-| Avg time (sec) | 0.020 |
-| P95 time (sec) | 0.038 |
-| Requests/sec | 48.20 |
-
-> **참고:** 만약 direct 접근이 connection refused로 실패한 경우, 보안 그룹 설정상 EC2 직접 접근이 차단된 것이므로 이 시나리오를 건너뛰고 다음 단계로 진행한다. 이는 정상적인 보안 구성이며 commands.md에 skip 사유를 명시한다.
-
-### Interpretation
-
-Direct EC2 경로가 ALB 경로보다 avg latency 기준 약 3ms 빠르게 측정됐다. 이는 ALB의 라우팅/처리 오버헤드로 설명된다. 그러나 ALB를 거치는 경로가 프로덕션 환경에서는 여전히 올바른 선택이다(이유: 헬스체크 기반 라우팅, 두 인스턴스 간 부하 분산, TLS 종료 처리 등).
 
 ---
 
 ## Interpretation Answers
 
-### Q1. 처리량 트렌드 (Throughput Trend)
-동시성이 10→40으로 4배 증가했을 때 RPS는 42.30→47.10으로 약 11%만 증가했다. 선형적으로 증가하지 않고 정체(plateau)에 가까워진 것은 백엔드 EC2 인스턴스의 처리 용량이 한계에 도달하고 있음을 의미한다.
+### 1. Throughput Trend (처리량 추세)
+동시성이 1→100으로 증가하면서 RPS는 676→8,896으로 증가했다. 그러나 C=50 이후 증가폭이 급격히 줄어들었다(C=50: +693, C=100: +147). C=100에서 사실상 처리량이 정체(plateau)되었으며, 이는 두 EC2 인스턴스가 처리할 수 있는 최대 용량에 근접했음을 의미한다.
 
-### Q2. 레이턴시 변화 (Latency Change)
-avg latency는 +65%, p95 latency는 +117% 증가했다. 이는 동시성 증가에 비례한 수준이 아니라 그 이상으로 불균형하게 악화된 것이다. 특히 tail latency(p95)의 급격한 증가는 일부 요청이 큐에서 대기하는 시간이 늘어났음을 시사한다.
+### 2. Latency Change (지연 시간 변화)
+avg latency는 C=1(1ms)에서 C=100(11ms)으로 11배 증가했다. p95 latency는 C=1(2ms)에서 C=100(15ms)으로 7.5배 증가했다. 특히 C=50→C=100 구간에서 avg가 5ms→11ms(+120%)로 불균형하게 급등했다. 동시성 증가율(2배)보다 latency 증가율이 훨씬 커 큐잉 현상이 시작됐음을 나타낸다.
 
-### Q3. 실패 요청 (Failed Requests)
-Scenario 1(C=10)에서는 0건, Scenario 2(C=40)에서 처음으로 2건의 실패가 발생했다. 동시성 40에서 최초 실패 신호가 나타났다.
+### 3. Failed Requests (실패 요청)
+전체 6개 시나리오, 총 3,660건의 요청에서 실패가 단 1건도 없었다(실패율 0.00%). C=100에서도 실패는 발생하지 않았으나 latency 급등이 포화의 첫 신호로 나타났다.
 
-### Q4. 타겟 헬스 (Target Health)
-벤치마크 시작 전 `aws elbv2 describe-target-health`로 두 인스턴스 모두 `State: healthy` 상태를 확인했다. 만약 unhealthy 타겟이 있었다면 ALB가 트래픽을 하나의 인스턴스로만 몰아 처리량은 절반으로 줄고 레이턴시는 상승했을 것이다.
+### 4. Target Health (타겟 상태)
+벤치마크 시작 전 두 인스턴스(i-0283f7034737c23f9, i-0e793ec6f067969ae) 모두 `State: healthy`를 확인했다. 두 인스턴스가 정상이었기 때문에 ALB가 트래픽을 균등하게 분산할 수 있었고, 단일 인스턴스였다면 포화 신호가 더 일찍 나타났을 것이다.
 
-### Q5. ALB vs Direct
-Direct EC2가 약 3ms 빠르게 측정됐더라도 ALB가 프로덕션에서 더 나은 경로다. ALB는 unhealthy 타겟으로의 자동 라우팅 차단, 두 인스턴스 간 부하 분산, HTTPS TLS 종료, path-based 라우팅 등의 기능을 제공하는데, direct 접근은 이 모든 기능을 우회하기 때문이다.
-
-### Q6. 장애 백엔드 (Degraded Backend)
-하나의 백엔드가 다운됐을 때: **가용성(Availability)**은 유지된다 — ALB가 healthy 인스턴스로만 라우팅하기 때문이다. 그러나 **용량(Capacity)**은 50% 감소한다 — 동일한 concurrency에서 RPS가 떨어지고 latency가 증가한다. 이 둘은 다른 개념이다.
-
-### Q7. CloudWatch 지표
-- `ALB: TargetResponseTime` — ab의 avg/p95 latency와 직접 대응되는 서버사이드 지표
-- `ALB: HTTPCode_ELB_5XX_Count` — ALB 자체 에러, EC2 에러와 구분 가능
-- `EC2: CPUUtilization` — C=40 구간에서 80%+ 도달 시 병목이 백엔드 컴퓨팅임을 확인
-- `ALB: RequestCount` — 벤치마크의 total request 수와 비교하여 실제 도달 트래픽 검증
-
-### Q8. 오토스케일링 트리거 (Autoscaling Trigger)
-`ALB: TargetResponseTime` (p95 기준)이 최선의 트리거 후보다. CPU가 한계에 도달하기 전에 사용자가 체감하는 응답 시간 저하가 먼저 나타나기 때문이다. 구체적으로, p95 latency가 baseline 대비 2배를 초과하는 시점을 scale-out 조건으로 설정하는 것이 적절하다.
+### 5. Where does saturation appear? (포화 신호)
+포화 신호는 C=50→C=100 구간에서 처음 명확하게 나타났다. RPS 증가가 +1.7%로 사실상 정체되고 avg latency가 +120% 급등했다. 실패 발생이나 RPS 정체보다 p95 latency 증가가 먼저 나타났으며, 이는 "tail latency가 capacity signal보다 먼저 나타난다"는 원칙과 일치한다.
 
 ---
 
 ## Cleanup
 
 ```bash
+cd ~/03-terraform-ec2-alb-hahyunnii/terraform-03-alb-two-ec2
 terraform destroy -auto-approve
 ```
 
-- **확인:** AWS Console에서 EC2 인스턴스가 `terminated`, ALB가 삭제됨을 확인
-- **결과:** 모든 리소스 정상 삭제 완료 — Learner Lab 크레딧 낭비 없음
+- EC2 인스턴스 2대 `terminated` 상태 확인
+- ALB 삭제 확인
+- Learner Lab 크레딧 낭비 없음

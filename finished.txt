@@ -1,0 +1,43 @@
+Week 8 Lab: Benchmark Using ab — FINISHED
+
+Completed checklist:
+[x] Preflight: ab installed (httpd-tools via dnf), repo cloned and scripts chmod +x
+[x] Infra deployed: terraform init / apply on terraform-03-alb-two-ec2
+[x] Target health verified (both EC2 targets: healthy)
+    - i-0283f7034737c23f9 (web-a, us-east-1a): healthy
+    - i-0e793ec6f067969ae (web-b, us-east-1b): healthy
+[x] Warm-up requests completed (5 curl requests to ALB DNS)
+[x] Raw ab check executed and interpreted
+    - ab -n 60 -c 1 "http://ccaws-tf03-alb-959492896.us-east-1.elb.amazonaws.com/"
+    - Complete: 60, Failed: 0, RPS: 676.90, p95: 2ms
+[x] Scenario 1 — latency-baseline (C=1, N=60, TARGET=alb)
+    - RPS: 676.90, avg: 1ms, p95: 2ms, failed: 0
+[x] Scenario 2 — throughput-baseline (C=10, N=100, TARGET=alb)
+    - RPS: 5481.25, avg: 2ms, p95: 2ms, failed: 0
+[x] Scenario 3 — concurrency-step-c20 (C=20, N=200, TARGET=alb)
+    - RPS: 7284.65, avg: 2ms, p95: 4ms, failed: 0
+[x] Scenario 4 — tail-latency-c30 (C=30, N=300, TARGET=alb)
+    - RPS: 8056.50, avg: 3ms, p95: 5ms, failed: 0
+[x] Scenario 5 — saturation-c50 (C=50, N=1000, TARGET=alb)
+    - RPS: 8749.75, avg: 5ms, p95: 9ms, failed: 0
+[x] Scenario 6 — saturation-c100 (C=100, N=2000, TARGET=alb)
+    - RPS: 8896.92, avg: 11ms, p95: 15ms, failed: 0
+[x] results/summary.csv reviewed and analyzed (bash scripts/analyze-summary.sh)
+    - Total requests: 3660, Successful: 3660, Failed: 0
+    - Best throughput: saturation-c100 at 8896.92 req/s
+    - Highest p95 latency: saturation-c100 at 0.015000 sec
+[x] commands.md written with raw ab output and all 5 interpretation answers
+[x] report.md written with full analysis including saturation signal identification
+[x] terraform destroy -auto-approve completed
+    - Resources: 9 destroyed
+[x] AWS Console confirmed: EC2 instances terminated, ALB removed
+
+Target URL: http://ccaws-tf03-alb-959492896.us-east-1.elb.amazonaws.com/
+ALB Name: ccaws-tf03-alb
+web-a: 32.197.44.252 (us-east-1a)
+web-b: 44.201.202.82 (us-east-1b)
+
+Submitted files:
+- commands.md
+- report.md
+- finished.txt

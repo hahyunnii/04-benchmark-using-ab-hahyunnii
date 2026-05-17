@@ -1,152 +1,127 @@
-# Report: Week 8 — EC2 + ALB Benchmark on AWS
+# report.md — Week 8 Lab: Benchmark Using ab
 
-## 1. 개요
+## 1. 실습 개요
 
-본 보고서는 AWS Academy Learner Lab 환경에서 Terraform으로 배포한 EC2 2대 + Application Load Balancer(ALB) 아키텍처에 대해 ApacheBench(ab)를 사용하여 수행한 벤치마크 테스트 결과를 분석한다. 실험의 목적은 시스템의 baseline 성능을 측정하고, 동시성(concurrency) 증가에 따른 처리량과 레이턴시 변화를 해석하며, ALB 경유 경로와 EC2 직접 경로를 비교하는 것이다.
+AWS Academy Learner Lab 환경에서 Terraform으로 배포한 EC2 2대 + ALB 아키텍처를 대상으로 ApacheBench(`ab`)를 사용하여 6개 시나리오의 HTTP 부하 테스트를 수행했다. 동시성을 C=1에서 C=100까지 단계적으로 높이며 처리량(RPS), 평균 지연 시간(avg), 꼬리 지연 시간(p95)의 변화를 측정하고 포화 지점을 탐색했다.
+
+- **테스트 환경:** AWS CloudShell (Amazon Linux 2023)
+- **대상 서버:** EC2 2대 (t3.micro, nginx/1.30.0) + ALB
+  - ALB DNS: `ccaws-tf03-alb-959492896.us-east-1.elb.amazonaws.com`
+  - web-a: `32.197.44.252` (us-east-1a)
+  - web-b: `44.201.202.82` (us-east-1b)
+- **사용 도구:** ApacheBench 2.3 (`httpd-tools`)
+- **래퍼 스크립트:** `scripts/run-sample-scenarios.sh`
 
 ---
 
 ## 2. 배포 아키텍처
 
 ```
-인터넷 클라이언트 (ab)
-        │
-        ▼
-Application Load Balancer (ALB)
-  - HTTP:80, 2개 AZ 걸침
-  - 헬스체크: 30초 간격, / 경로, HTTP 200 기준
-        │
-  ┌─────┴──────┐
-  ▼            ▼
-EC2 #1        EC2 #2
-(t2.micro)    (t2.micro)
-us-east-1a    us-east-1b
+인터넷 클라이언트 (ab / CloudShell)
+             │
+             ▼
+  Application Load Balancer (ALB)
+  ccaws-tf03-alb-959492896.us-east-1.elb.amazonaws.com
+  HTTP:80, 2개 AZ
+             │
+      ┌──────┴──────┐
+      ▼             ▼
+   EC2 web-a     EC2 web-b
+   t3.micro      t3.micro
+   us-east-1a    us-east-1b
+   nginx:8080    nginx:8080
 ```
 
-- Terraform으로 모든 리소스를 코드로 정의 및 배포
-- 두 EC2 인스턴스는 각각 다른 AZ에 배치 (ALB 요구사항: 최소 2개 AZ)
-- 보안 그룹: ALB와 EC2 모두 HTTP:80 인바운드 허용 (Scenario 3 direct 접근을 위해)
+- Terraform으로 모든 리소스 코드 정의 및 배포
+- 벤치마크 전 두 인스턴스 모두 `State: healthy` 확인
 
 ---
 
-## 3. 벤치마크 방법론
+## 3. 벤치마크 결과
 
-### 도구
-- **Primary:** ApacheBench (ab) — HTTP/1.1, 백분위 레이턴시 지원
-- **Wrapper:** `scripts/benchmark-ec2-alb.sh` — CSV 결과 자동 기록
-- **Fallback:** curl 루프 (ab 미설치 시 자동 전환, p95는 n/a로 기록)
+### summary.csv
 
-### 실험 설계 원칙
-- 각 시나리오마다 하나의 변수만 변경 (단일 변수 변화 원칙)
-- 벤치마크 전 5회 워밍업 요청 실행
-- 각 시나리오 시작 전 `aws elbv2 describe-target-health`로 타겟 헬스 확인
-- Scenario 1에서만 `RESET_SUMMARY=true` 사용 (CSV 초기화)
+```
+scenario,target,tool,requests,concurrency,success,failed,avg_time_sec,p95_time_sec,requests_per_sec
+latency-baseline,alb,ab,60,1,60,0,0.001000,0.002000,676.90
+throughput-baseline,alb,ab,100,10,100,0,0.002000,0.002000,5481.25
+concurrency-step-c20,alb,ab,200,20,200,0,0.002000,0.004000,7284.65
+tail-latency-c30,alb,ab,300,30,300,0,0.003000,0.005000,8056.50
+saturation-c50,alb,ab,1000,50,1000,0,0.005000,0.009000,8749.75
+saturation-c100,alb,ab,2000,100,2000,0,0.011000,0.015000,8896.92
+```
 
----
+### 전체 결과 표
 
-## 4. 실험 결과 (summary.csv)
-
-| Scenario | Target | Tool | Requests | Concurrency | Success | Failed | Fail Rate | Avg Time (sec) | P95 Time (sec) | Requests/sec |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline-alb | alb | ab | 100 | 10 | 100 | 0 | 0.00% | 0.023400 | 0.041000 | 42.30 |
-| higher-concurrency-alb | alb | ab | 400 | 40 | 398 | 2 | 0.50% | 0.038000 | 0.089000 | 47.10 |
-| direct-compare | direct | ab | 100 | 10 | 100 | 0 | 0.00% | 0.020000 | 0.038000 | 48.20 |
-
----
-
-## 5. 결과 분석
-
-### 5.1 처리량 (Throughput) 분석
-
-동시성이 10→40(4배)으로 증가했을 때 처리량은 42.30→47.10 req/s로 약 **11% 증가**에 그쳤다. 동시성 증가에 비례한 선형 증가(이론상 4배, 약 169 req/s)는 관찰되지 않았다. 이는 t2.micro 인스턴스의 단일 vCPU 한계와 ALB-to-EC2 간 연결 처리 오버헤드로 설명된다. 처리량이 정체(plateau)되기 시작한 것은 시스템이 포화 임계점에 접근하고 있음을 나타낸다.
-
-### 5.2 레이턴시 (Latency) 분석
-
-| 지표 | Scenario 1 (C=10) | Scenario 2 (C=40) | 변화율 |
-|---|---|---|---|
-| Avg latency | 23 ms | 38 ms | **+65%** |
-| P95 latency | 41 ms | 89 ms | **+117%** |
-
-평균 레이턴시보다 p95 레이턴시의 증가폭이 훨씬 크다는 점이 핵심이다. 이는 **tail latency 악화** 현상으로, 동시성이 높아질수록 일부 요청이 큐에서 오래 대기하게 되어 전체 평균은 적당해 보여도 실제 일부 사용자는 훨씬 긴 응답 시간을 경험하고 있음을 의미한다.
-
-> **함의:** 평균 레이턴시만 보고 "괜찮다"고 판단하는 것은 위험하다. p95/p99 tail latency를 항상 함께 보아야 한다.
-
-### 5.3 실패 요청 (Failed Requests) 분석
-
-- Scenario 1 (C=10): 실패 0건 → 시스템 정상 기준선 확인
-- Scenario 2 (C=40): 실패 2건 (0.50%) → **동시성 40에서 최초 에러 신호 발생**
-
-2건의 실패는 절대 수치로는 작지만, baseline에서 전무했던 에러가 등장했다는 사실 자체가 중요한 신호다. 이 시점이 향후 오토스케일링 트리거를 설정할 때 참고해야 할 경계 구간이다.
-
-### 5.4 ALB vs Direct EC2 비교
-
-| 지표 | ALB 경로 (Scenario 1) | Direct 경로 (Scenario 3) | 차이 |
-|---|---|---|---|
-| Avg latency | 23 ms | 20 ms | -3 ms (Direct가 빠름) |
-| P95 latency | 41 ms | 38 ms | -3 ms (Direct가 빠름) |
-| Requests/sec | 42.30 | 48.20 | +5.9 (Direct가 높음) |
-
-Direct EC2 경로가 소폭 빠르게 측정됐다. 이는 ALB의 라우팅 처리, 헬스체크 수행, 요청 분배 등의 오버헤드(약 3ms)가 반영된 것이다. 그러나 이것이 ALB를 제거해야 한다는 의미가 아님을 강조해야 한다.
-
-**ALB가 프로덕션에서 반드시 필요한 이유:**
-- 자동 헬스체크: unhealthy 인스턴스로의 라우팅 자동 차단
-- 부하 분산: 두 EC2 인스턴스에 트래픽을 나눠 전체 처리 용량 증대
-- TLS 종료: HTTPS 처리를 ALB가 담당해 EC2 CPU 절감
-- Path-based 라우팅: `/api/`와 `/web/` 등 경로별 다른 타겟 그룹으로 분기 가능
-
-> 결론: Direct 경로의 3ms 이득은 위 기능들을 포기하는 비용에 비해 무의미하다.
+| 시나리오 | 동시성 | 요청 수 | 성공 | 실패 | RPS | avg (ms) | p95 (ms) |
+|---|---|---|---|---|---|---|---|
+| latency-baseline | 1 | 60 | 60 | 0 | 676.90 | 1 | 2 |
+| throughput-baseline | 10 | 100 | 100 | 0 | 5,481.25 | 2 | 2 |
+| concurrency-step-c20 | 20 | 200 | 200 | 0 | 7,284.65 | 2 | 4 |
+| tail-latency-c30 | 30 | 300 | 300 | 0 | 8,056.50 | 3 | 5 |
+| saturation-c50 | 50 | 1,000 | 1,000 | 0 | 8,749.75 | 5 | 9 |
+| saturation-c100 | 100 | 2,000 | 2,000 | 0 | **8,896.92** | **11** | **15** |
 
 ---
 
-## 6. 아키텍처 해석
+## 4. 결과 분석
 
-### 가용성(Availability) vs 용량(Capacity) 구분
+### 4.1 처리량(Throughput) 추세
 
-만약 하나의 EC2 인스턴스가 다운됐다면:
+| 구간 | RPS 증가량 | 증가율 |
+|---|---|---|
+| C=1 → C=10 | +4,804 | +710% |
+| C=10 → C=20 | +1,803 | +33% |
+| C=20 → C=30 | +771 | +11% |
+| C=30 → C=50 | +693 | +8.6% |
+| C=50 → C=100 | +147 | **+1.7%** ← 정체 |
 
-- **가용성은 유지됨:** ALB가 healthy 인스턴스 1대로만 라우팅 → 서비스 계속 제공
-- **용량은 50% 감소:** 동일 동시성에서 RPS 하락, latency 상승
-- **사용자 관점:** 서비스는 살아있지만 성능이 저하됨
+C=50 이후 RPS 증가폭이 급격히 줄어들어 C=100에서 사실상 처리량이 정체(plateau)되었다. 동시성을 2배로 늘렸음에도 처리량이 1.7%밖에 증가하지 않은 것은 두 EC2 인스턴스가 처리 가능한 최대 용량에 근접했음을 의미한다.
 
-이 구분은 인시던트 대응(Incident Response) 설계의 핵심이다. ALB의 헬스체크 기반 라우팅이 가용성을 보장하는 동안, 오토스케일링 정책이 용량을 회복시키도록 설계해야 한다.
+### 4.2 지연 시간(Latency) 분석
 
-### CloudWatch 연계
+| 구간 | avg 변화 | p95 변화 |
+|---|---|---|
+| C=1 → C=50 | 1ms → 5ms (+400%) | 2ms → 9ms (+350%) |
+| C=50 → C=100 | 5ms → **11ms (+120%)** | 9ms → **15ms (+67%)** |
 
-| ab 결과 지표 | 대응 CloudWatch 지표 |
-|---|---|
-| Requests/sec | `ALB: RequestCount` |
-| avg/p95 latency | `ALB: TargetResponseTime` |
-| Failed requests | `ALB: HTTPCode_Target_5XX_Count` |
-| (직접 측정 불가) | `EC2: CPUUtilization` |
+C=50→C=100 구간에서 avg latency가 120% 급등했다. 동시성 증가율(2배)보다 latency 증가율이 훨씬 커 요청 큐잉 현상이 시작되었음을 나타낸다. 이 구간이 시스템의 실질적인 포화 시작점이다.
 
-CloudWatch와 ab 결과를 교차 검증하면 병목이 ALB 레벨인지 EC2 백엔드 레벨인지 판별할 수 있다.
+### 4.3 안정성 분석
 
-### 오토스케일링 트리거 권고
+전체 6개 시나리오, 총 3,660건의 요청에서 실패가 단 1건도 없었다(실패율 0.00%). C=100, 2,000 요청의 고부하 상황에서도 완전히 안정적이었다. 실패가 아닌 latency 증가가 먼저 포화 신호로 나타났다.
 
-**권장 지표:** `ALB TargetResponseTime` (p95 기준)
+### 4.4 포화 신호 분석
 
-CPU 임계치 도달보다 사용자 체감 레이턴시 저하가 먼저 나타나기 때문에, p95 latency가 baseline 대비 2배(~82ms)를 초과하는 시점을 scale-out 트리거로 설정하는 것이 적절하다.
+**포화 신호 발생 순서:**
+1. **p95 latency 증가** — C=20부터 2ms→4ms로 증가 시작
+2. **RPS 증가 정체** — C=50 이후 증가폭 급감
+3. **avg latency 급등** — C=100에서 +120%
+4. **실패 발생** — 테스트 범위 내에서 미발생
 
----
-
-## 7. 결론
-
-| 질문 | 답변 |
-|---|---|
-| Baseline 성능은? | 42.30 req/s, avg 23ms, p95 41ms, 실패 0 |
-| 동시성 4배 증가 시 처리량은? | 11% 소폭 증가 (선형 확장 불가) |
-| Tail latency 변화는? | p95 +117% — 포화 징조 |
-| ALB 오버헤드는? | 약 3ms — 제공 기능 대비 무시 가능한 수준 |
-| 첫 에러 발생 구간은? | C=40 (0.50% 실패율) |
-
-이번 벤치마크를 통해 2대의 t2.micro + ALB 구성은 동시성 10에서 쾌적한 baseline을 제공하지만, 동시성 40에서는 tail latency 급증과 소수 실패가 발생하기 시작함을 확인했다. 이 데이터는 다음 주 Auto Scaling 정책 설계의 정량적 기준점으로 활용한다.
+실패 발생보다 latency 증가와 RPS 정체가 먼저 나타났다. 이는 이론에서 배운 "tail latency가 capacity signal보다 먼저 나타난다"는 원칙과 일치한다.
 
 ---
 
-## 8. 리소스 정리
+## 5. 핵심 학습 사항
+
+**처리량과 지연 시간은 함께 해석해야 한다.** C=100에서 RPS 8,896은 최고값이지만 avg latency 11ms, p95 15ms는 포화 신호다. RPS만 보면 "더 잘 된다"고 착각할 수 있다.
+
+**p95 latency는 평균보다 중요한 신호다.** avg 11ms는 양호해 보여도 p95 15ms는 상위 5% 사용자가 더 긴 응답을 경험한다는 의미다. 운영 환경에서는 p95/p99를 모니터링해야 한다.
+
+**포화 지점은 실패 발생 전에 먼저 감지된다.** C=100에서 실패는 없었지만 RPS 정체와 latency 급등이 먼저 나타났다. 이 신호를 조기에 감지하고 오토스케일링 트리거로 활용해야 한다.
+
+**ALB + 2대 EC2 구성의 실질적인 처리 한계는 C=50~100 구간이다.** 이 데이터는 다음 단계 오토스케일링 정책 설계의 정량적 기준점으로 활용할 수 있다.
+
+---
+
+## 6. 인프라 정리
 
 ```bash
+cd ~/03-terraform-ec2-alb-hahyunnii/terraform-03-alb-two-ec2
 terraform destroy -auto-approve
 ```
 
-모든 AWS 리소스(EC2 × 2, ALB, Target Group, Listener, Security Group, VPC, Subnet, IGW)를 삭제 완료했다. Learner Lab 크레딧 낭비 없음.
+- EC2 인스턴스 2대 `terminated` 상태 확인
+- ALB 삭제 확인
+- Learner Lab 크레딧 낭비 없음
